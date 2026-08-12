@@ -647,6 +647,15 @@ class ProbeEddy:
         gcode.register_command("EDDYNG_START_STREAM_EXPERIMENTAL", self.cmd_START_STREAM, "")
         gcode.register_command("EDDYNG_STOP_STREAM_EXPERIMENTAL", self.cmd_STOP_STREAM, "")
 
+        gcode.register_command(
+            "PROBE_EDDY_NG_RANDOM_TAP",
+            self.cmd_RANDOM_TAP,
+            self.cmd_RANDOM_TAP_help,
+        )
+
+        # Track exclude_object if present
+        self._exclude_obj = self._printer.lookup_object("exclude_object", None)
+
     def _handle_command_error(self, gcmd=None):
         try:
             if self._sampler is not None:
@@ -827,6 +836,237 @@ class ProbeEddy:
 
     def cmd_MESH(self, gcmd: GCodeCommand):
         self._bed_mesh_helper.scan()
+
+    # Helpers for RANDOM_TAP
+
+    def _get_bed_limits(self) -> Tuple[float, float, float, float]:
+        """Return (min_x, min_y, max_x, max_y) for the printable bed in nozzle coordinates."""
+        kin = self._toolhead.get_kinematics()
+        rails = kin.rails
+        x_min, x_max = rails[0].get_range()
+        y_min, y_max = rails[1].get_range()
+        return x_min, y_min, x_max, y_max
+
+    def _get_active_objects_bounds(self) -> List[Tuple[float, float, float, float]]:
+        """Return list of (min_x, min_y, max_x, max_y) for currently loaded/active objects."""
+        if self._exclude_obj is None:
+            return []
+
+        status = self._exclude_obj.get_status(None)
+        objects = status.get("objects", {})
+        bounds_list = []
+
+        for name, obj in objects.items():
+            if not obj.get("included", True):
+                continue
+            # Only consider objects that are currently being printed (have a last_position)
+            if obj.get("last_position") is None:
+                continue
+            min_x = obj.get("min_x")
+            min_y = obj.get("min_y")
+            max_x = obj.get("max_x")
+            max_y = obj.get("max_y")
+            if all(v is not None for v in (min_x, min_y, max_x, max_y)):
+                bounds_list.append((min_x, min_y, max_x, max_y))
+
+        return bounds_list
+
+    def _box_area(self, bx: float, by: float, ex: float, ey: float) -> float:
+        w = max(0.0, ex - bx)
+        h = max(0.0, ey - by)
+        return w * h
+
+    def _boxes_overlap(self, a: Tuple[float, float, float, float], b: Tuple[float, float, float, float]) -> bool:
+        return not (a[2] <= b[0] or b[2] <= a[0] or a[3] <= b[1] or b[3] <= a[1])
+
+    def _box_grow(self, bx: float, by: float, ex: float, ey: float, margin: float) -> Tuple[float, float, float, float]:
+        return bx - margin, by - margin, ex + margin, ey + margin
+
+    def _box_intersection(self, a: Tuple[float, float, float, float], b: Tuple[float, float, float, float]) -> Tuple[float, float, float, float] | None:
+        ix0 = max(a[0], b[0])
+        iy0 = max(a[1], b[1])
+        ix1 = min(a[2], b[2])
+        iy1 = min(a[3], b[3])
+        if ix0 < ix1 and iy0 < iy1:
+            return ix0, iy0, ix1, iy1
+        return None
+
+    def _box_subtract(self, outer: Tuple[float, float, float, float], hole: Tuple[float, float, float, float]) -> List[Tuple[float, float, float, float]]:
+        """Subtract hole from outer, return list of remaining axis-aligned boxes."""
+        inter = self._box_intersection(outer, hole)
+        if inter is None:
+            return [outer]
+
+        ix0, iy0, ix1, iy1 = inter
+        ox0, oy0, ox1, oy1 = outer
+
+        result = []
+        # left strip
+        if ox0 < ix0:
+            result.append((ox0, oy0, ix0, oy1))
+        # right strip
+        if ix1 < ox1:
+            result.append((ix1, oy0, ox1, oy1))
+        # top strip (between holes in x)
+        if iy1 < oy1:
+            result.append((max(ox0, ix0), iy1, min(ox1, ix1), oy1))
+        # bottom strip
+        if oy0 < iy0:
+            result.append((max(ox0, ix0), oy0, min(ox1, ix1), iy0))
+        return result
+
+    def _get_free_regions(self, margin: float) -> List[Tuple[float, float, float, float]]:
+        """Return list of free rectangular regions in nozzle coords.
+
+        Uses bed limits minus active objects (with given margin).
+        """
+        bed = self._get_bed_limits()
+        objects = self._get_active_objects_bounds()
+        if not objects:
+            return [bed]
+
+        # Add margin around objects so we don't probe too close
+        objects = [self._box_grow(*o, margin) for o in objects]
+
+        free = [bed]
+        for hole in objects:
+            new_free = []
+            for region in free:
+                new_free.extend(self._box_subtract(region, hole))
+            free = new_free
+
+        # Filter invalid/negligible regions
+        min_area = 4.0  # at least 2x2mm
+        free = [r for r in free if self._box_area(*r) >= min_area]
+        return free
+
+    def _pick_random_point_in_box(self, bx: float, by: float, ex: float, ey: float) -> Tuple[float, float]:
+        x = np.random.uniform(bx, ex)
+        y = np.random.uniform(by, ey)
+        return float(x), float(y)
+
+    def _pick_random_free_point(self, margin: float) -> Tuple[float, float, float, float] | None:
+        """Pick a random (nozzle_x, nozzle_y) in a free region; returns (x,y,bx,by) or None."""
+        free = self._get_free_regions(margin)
+        if not free:
+            return None
+
+        # Weight by area
+        areas = [self._box_area(*r) for r in free]
+        total = sum(areas)
+        r = np.random.uniform(0.0, total)
+        cum = 0.0
+        for region, area in zip(free, areas):
+            cum += area
+            if r <= cum:
+                x, y = self._pick_random_point_in_box(*region)
+                return x, y, region[0], region[1]
+        return None
+
+    def _find_fallback_point_outside_objects(self, margin: float) -> Tuple[float, float] | None:
+        """If bed is fully occupied, try to find a point outside all objects but still inside bed.
+
+        Strategy: sample along bed perimeter and inside between objects. Returns nozzle coords.
+        """
+        bed = self._get_bed_limits()
+        bx0, by0, bx1, by1 = bed
+        objects = self._get_active_objects_bounds()
+        if not objects:
+            # degenerate: no objects but no free regions -> just center
+            return (bx0 + bx1) / 2.0, (by0 + by1) / 2.0
+
+        objects_grown = [self._box_grow(*o, margin) for o in objects]
+
+        def is_inside_any(px, py):
+            for (ox0, oy0, ox1, oy1) in objects_grown:
+                if ox0 <= px <= ox1 and oy0 <= py <= oy1:
+                    return True
+            return False
+
+        # Try perimeter sampling
+        step = 2.0
+        candidates = []
+        # top/bottom edges
+        x = bx0
+        while x <= bx1:
+            for y in (by0, by1):
+                if bx0 <= x <= bx1 and by0 <= y <= by1 and not is_inside_any(x, y):
+                    candidates.append((x, y))
+            x += step
+        # left/right edges
+        y = by0
+        while y <= by1:
+            for x in (bx0, bx1):
+                if bx0 <= x <= bx1 and by0 <= y <= by1 and not is_inside_any(x, y):
+                    candidates.append((x, y))
+            y += step
+
+        if candidates:
+            return candidates[np.random.randint(len(candidates))]
+
+        # Try grid search inside bed
+        grid = 5.0
+        xs = np.arange(bx0 + grid / 2, bx1, grid)
+        ys = np.arange(by0 + grid / 2, by1, grid)
+        for y in ys:
+            for x in xs:
+                if not is_inside_any(x, y):
+                    return float(x), float(y)
+
+        return None
+
+    cmd_RANDOM_TAP_help = "Perform a tap at a random location outside the current print area (based on exclude_object), or fallback to a free spot if bed is full. Use MARGIN=<mm> to set distance from objects (default 5mm)."
+
+    def cmd_RANDOM_TAP(self, gcmd: GCodeCommand):
+        if not self._xy_homed():
+            raise self._printer.command_error("X and Y must be homed before RANDOM_TAP")
+
+        margin: float = gcmd.get_float("MARGIN", 5.0, minval=0.0)
+
+        # Get bed limits in nozzle coords
+        bx0, by0, bx1, by1 = self._get_bed_limits()
+
+        # Probe offset (nozzle relative to probe)
+        px_off = self.params.x_offset
+        py_off = self.params.y_offset
+
+        # Try to pick a random free point in nozzle coords
+        result = self._pick_random_free_point(margin)
+        if result is not None:
+            nz_x, nz_y, _rbx, _rby = result
+        else:
+            # Bed fully occupied; try fallback
+            fallback = self._find_fallback_point_outside_objects(margin)
+            if fallback is None:
+                raise self._printer.command_error("RANDOM_TAP: no suitable free location found on bed")
+            nz_x, nz_y = fallback
+
+        # Convert nozzle coords to probe coords
+        probe_x = nz_x + px_off
+        probe_y = nz_y + py_off
+
+        # Clamp probe coords to bed limits
+        probe_x = max(bx0, min(bx1, probe_x))
+        probe_y = max(by0, min(by1, probe_y))
+
+        th = self._toolhead
+        lift_z = max(self.params.home_trigger_height + 5.0, 10.0)
+
+        self._log_msg(f"RANDOM_TAP: nozzle target ({nz_x:.2f}, {nz_y:.2f}), probe at ({probe_x:.2f}, {probe_y:.2f})")
+
+        # Move to tap height, then to target
+        th.manual_move([None, None, lift_z], self.params.lift_speed)
+        th.manual_move([probe_x, probe_y, None], self.params.move_speed)
+        th.wait_moves()
+
+        # Now perform tap using existing tap logic
+        # Reuse cmd_TAP but with our current position
+        try:
+            self.cmd_TAP(gcmd)
+        except self._printer.command_error as e:
+            # Lift after failed tap
+            th.manual_move([None, None, lift_z], self.params.lift_speed)
+            raise e
 
     cmd_STATUS_help = "Query the last raw coil value and status"
 
