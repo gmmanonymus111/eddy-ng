@@ -1015,7 +1015,7 @@ class ProbeEddy:
 
         return None
 
-    cmd_RANDOM_TAP_help = "Perform a tap at a random location outside the current print area (based on exclude_object), or fallback to a free spot if bed is full. Use MARGIN=<mm> to set distance from objects (default 5mm)."
+    cmd_RANDOM_TAP_help = "Perform a tap at a random location outside the current print area (based on exclude_object), or fallback to a free spot if bed is full. Use MARGIN=<mm> to set distance from objects (default 5mm). Tap parameters (e.g. START_Z, SPEED, THRESHOLD) are forwarded to PROBE_EDDY_NG_TAP."
 
     def cmd_RANDOM_TAP(self, gcmd: GCodeCommand):
         if not self._xy_homed():
@@ -1059,10 +1059,36 @@ class ProbeEddy:
         th.manual_move([probe_x, probe_y, None], self.params.move_speed)
         th.wait_moves()
 
-        # Now perform tap using existing tap logic
-        # Reuse cmd_TAP but with our current position
+        # Build a synthetic command that forwards only tap-relevant parameters,
+        # while forcing X/Y/Z to the random location (nozzle coords).
+        # This avoids positional conflicts and keeps behavior predictable.
+        tap_params = {
+            "X": str(nz_x),
+            "Y": str(nz_y),
+        }
+
+        # Parameters that PROBE_EDDY_NG_TAP understands and that make sense to forward
+        forward_params = [
+            "START_Z",
+            "TARGET_Z",
+            "SPEED",
+            "LIFT_SPEED",
+            "THRESHOLD",
+            "SAMPLES",
+            "MAX_SAMPLES",
+            "MODE",
+        ]
+        for key in forward_params:
+            val = gcmd.get(key, None)
+            if val is not None:
+                tap_params[key] = val
+
         try:
-            self.cmd_TAP(gcmd)
+            # Create a synthetic gcode command so cmd_TAP sees the same parameter set
+            synthetic = self._gcode.create_gcode_command(
+                "PROBE_EDDY_NG_TAP", "PROBE_EDDY_NG_TAP", tap_params
+            )
+            self.cmd_TAP(synthetic)
         except self._printer.command_error as e:
             # Lift after failed tap
             th.manual_move([None, None, lift_z], self.params.lift_speed)
