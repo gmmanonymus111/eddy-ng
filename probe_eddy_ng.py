@@ -1015,13 +1015,14 @@ class ProbeEddy:
 
         return None
 
-    cmd_RANDOM_TAP_help = "Perform a tap at a random location outside the current print area (based on exclude_object), or fallback to a free spot if bed is full. Use MARGIN=<mm> to set distance from objects (default 5mm). Tap parameters (e.g. START_Z, SPEED, THRESHOLD) are forwarded to PROBE_EDDY_NG_TAP."
+    cmd_RANDOM_TAP_help = "Perform a tap at a random location outside the current print area (based on exclude_object), or fallback to a free spot if bed is full. Prefers points near bed center and avoids edges. Use MARGIN=<mm> to set distance from objects (default 5mm), EDGE_MARGIN=<mm> for distance from bed edges (default 10mm). Tap parameters (e.g. START_Z, SPEED, THRESHOLD) are forwarded to PROBE_EDDY_NG_TAP."
 
     def cmd_RANDOM_TAP(self, gcmd: GCodeCommand):
         if not self._xy_homed():
             raise self._printer.command_error("X and Y must be homed before RANDOM_TAP")
 
         margin: float = gcmd.get_float("MARGIN", 5.0, minval=0.0)
+        edge_margin: float = gcmd.get_float("EDGE_MARGIN", 10.0, minval=0.0)
 
         # Get bed limits in nozzle coords
         bx0, by0, bx1, by1 = self._get_bed_limits()
@@ -1030,12 +1031,39 @@ class ProbeEddy:
         px_off = self.params.x_offset
         py_off = self.params.y_offset
 
-        # Try to pick a random free point in nozzle coords
-        result = self._pick_random_free_point(margin)
-        if result is not None:
-            nz_x, nz_y, _rbx, _rby = result
+        # Bed center
+        bed_cx = (bx0 + bx1) / 2.0
+        bed_cy = (by0 + by1) / 2.0
+
+        # Safe zone: inset from bed edges so probe won't be on very edges
+        safe_x0 = max(bx0, bx0 + edge_margin)
+        safe_y0 = max(by0, by0 + edge_margin)
+        safe_x1 = min(bx1, bx1 - edge_margin)
+        safe_y1 = min(by1, by1 - edge_margin)
+
+        if safe_x0 >= safe_x1 or safe_y0 >= safe_y1:
+            raise self._printer.command_error("RANDOM_TAP: EDGE_MARGIN too large for bed size")
+
+        # Compute free regions, then intersect with safe zone
+        free = self._get_free_regions(margin)
+        safe_zone = (safe_x0, safe_y0, safe_x1, safe_y1)
+        safe_free = []
+        for region in free:
+            inter = self._box_intersection(region, safe_zone)
+            if inter is not None and self._box_area(*inter) >= 4.0:
+                safe_free.append(inter)
+
+        def dist_to_center(box: Tuple[float, float, float, float]) -> float:
+            cx = (box[0] + box[2]) / 2.0
+            cy = (box[1] + box[3]) / 2.0
+            return math.hypot(cx - bed_cx, cy - bed_cy)
+
+        if safe_free:
+            # Prefer region closest to bed center, then pick random point inside it
+            best_region = min(safe_free, key=dist_to_center)
+            nz_x, nz_y = self._pick_random_point_in_box(*best_region)
         else:
-            # Bed fully occupied; try fallback
+            # No free region inside safe zone; try fallback near center
             fallback = self._find_fallback_point_outside_objects(margin)
             if fallback is None:
                 raise self._printer.command_error("RANDOM_TAP: no suitable free location found on bed")
